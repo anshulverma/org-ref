@@ -29,31 +29,32 @@
 (require 'dash)
 (require 'f)
 (require 'org)
-(require 'org-ref)
 (require 's)
+(require 'org-ref-utils)
 
 ;; This is a local variable defined in `url-http'.  We need it to avoid
 ;; byte-compiler errors.
-(defvar-local url-http-end-of-headers nil)
+(defvar url-http-end-of-headers)
+(defvar org-ref-default-bibliography)
+(defvar org-ref-pdf-directory)
+
+(declare-function parsebib-find-bibtex-dialect "parsebib")
+(declare-function org-ref-clean-bibtex-entry "org-ref-core")
 
 ;;* The org-mode link
 ;; this just makes a clickable link that opens the entry.
 ;; example: arxiv:cond-mat/0410285
-(org-add-link-type
- "arxiv"
- ;; clicking
- (lambda (link-string)
-   (browse-url (format "http://arxiv.org/abs/%s" link-string)))
- ;; formatting
- (lambda (keyword desc format)
-   (cond
-    ((eq format 'html)
-     (format  "<a href=\"http://arxiv.org/abs/%s\">arxiv:%s</a>"
-	      keyword  (or desc keyword)))
-    ((eq format 'latex)
-     ;; write out the latex command
-     (format "\\url{http://arxiv.org/abs/%s}{%s}" keyword (or desc keyword))))))
-
+(org-ref-link-set-parameters "arxiv"
+  :follow (lambda (link-string)
+            (browse-url (format "http://arxiv.org/abs/%s" link-string)))
+  :export (lambda (keyword desc format)
+            (cond
+             ((eq format 'html)
+              (format  "<a href=\"http://arxiv.org/abs/%s\">arxiv:%s</a>"
+                       keyword  (or desc keyword)))
+             ((eq format 'latex)
+              ;; write out the latex command
+              (format "\\url{http://arxiv.org/abs/%s}{%s}" keyword (or desc keyword))))))
 
 ;;* Getting a bibtex entry for an arXiv article using remote service:
 ;; For an arxiv article, there is a link to a NASA ADS page like this:
@@ -94,6 +95,7 @@
 ;; extracts the necessary information, and formats a new BibTeX entry.
 
 (defvar arxiv-entry-format-string "@article{%s,
+  journal = {CoRR},
   title = {%s},
   author = {%s},
   archivePrefix = {arXiv},
@@ -128,6 +130,8 @@ Returns a formatted BibTeX entry."
            (temp-bibtex (format arxiv-entry-format-string "" title names year arxiv-number category abstract url))
            (key (with-temp-buffer
                   (insert temp-bibtex)
+		  (bibtex-mode)
+		  (bibtex-set-dialect (parsebib-find-bibtex-dialect) t)
                   (bibtex-generate-autokey))))
       (format arxiv-entry-format-string key title names year arxiv-number category abstract url))))
 
@@ -145,7 +149,7 @@ Returns a formatted BibTeX entry."
   (interactive
    (list (read-string "arxiv: ")
          ;;  now get the bibfile to add it to
-         (ido-completing-read
+         (completing-read
           "Bibfile: "
           (append (f-entries "." (lambda (f) (f-ext? f "bib")))
                   org-ref-default-bibliography))))
@@ -154,6 +158,7 @@ Returns a formatted BibTeX entry."
     (goto-char (point-max))
     (when (not (looking-at "^")) (insert "\n"))
     (insert (arxiv-get-bibtex-entry-via-arxiv-api arxiv-number))
+    (org-ref-clean-bibtex-entry)
     (save-buffer)))
 
 
@@ -172,17 +177,10 @@ Returns a formatted BibTeX entry."
                    (match-string 1))))
     (url-copy-file pdf-url pdf)
     ;; now check if we got a pdf
-    (with-temp-buffer
-      (insert-file-contents pdf)
-      ;; PDFS start with %PDF-1.x as the first few characters.
-      (if (not (string= (buffer-substring 1 6) "%PDF-"))
-          (progn
-            (message "%s" (buffer-string))
-            (delete-file pdf))
-        (message "%s saved" pdf)))
-
-    (org-open-file pdf)))
-
+    (if (org-ref-pdf-p pdf)
+        (org-open-file pdf)
+      (delete-file pdf)
+      (message "Error downloading arxiv pdf %s" pdf-url))))
 
 ;;;###autoload
 (defun arxiv-get-pdf-add-bibtex-entry (arxiv-number bibfile pdfdir)
@@ -193,11 +191,11 @@ key."
   (interactive
    (list (read-string "arxiv: ")
          ;;  now get the bibfile to add it to
-         (ido-completing-read
+         (completing-read
           "Bibfile: "
           (append (f-entries "." (lambda (f) (f-ext? f "bib")))
                   org-ref-default-bibliography))
-         (ido-read-directory-name
+         (read-directory-name
           "PDF directory: "
           org-ref-pdf-directory)))
 

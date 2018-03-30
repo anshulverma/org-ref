@@ -10,6 +10,16 @@
 ;;; Commentary:
 ;;
 
+(declare-function org-ref-get-bibtex-key-and-file "org-ref-core")
+(declare-function org-ref-get-bibtex-keys "org-ref-core")
+(declare-function parsebib-find-bibtex-dialect "parsebib")
+(defvar org-export-current-backend)
+(defvar org-ref-cite-types)
+
+(require 'org-element)
+
+
+
 ;;; Code:
 (defvar *orcp-citation-links* '()
   "List of citation links in the text.
@@ -786,7 +796,6 @@ Collapsed ranges are separated by DELIMITER."
 		(mapcar 'reverse (reverse groups)))
 	       delimiter)))
 
-(provide 'org-ref-citeproc)
 
 ;;* Putting it all together
 
@@ -856,7 +865,7 @@ documents."
 		    'chomp-trailing-space
 		    (intern (org-element-property :type link)))
 	       (goto-char end)
-	       (while (looking-at " " (- (point) 2))
+	       (while (looking-back " " (- (point) 2))
 		 (delete-char 1)))
 
 	     ;; Check for transposing punctuation
@@ -872,7 +881,7 @@ documents."
 
 	     ;; preserve trailing space
 	     (goto-char end)
-	     (setq trailing-space (if (looking-back " ") " " ""))
+	     (setq trailing-space (if (looking-back " " (line-beginning-position)) " " ""))
 
 	     (setf (buffer-substring start end) (concat repl trailing-space))
 
@@ -905,4 +914,6 @@ documents."
        (when link-replacements
          (message "Warning: No bibliography link found although there are citations to process"))))))
 
+;; * the end
+(provide 'org-ref-citeproc)
 ;;; org-ref-citeproc.el ends here

@@ -21,16 +21,28 @@
 ;;; Commentary:
 ;; This file defines the completion engine for org-ref using `helm-bibtex'.
 
+
+(declare-function 'org-ref-find-bibliography "org-ref-core.el")
+(declare-function 'org-ref-get-bibtex-key-and-file "org-ref-core.el")
+
+(defvar org-ref-get-pdf-filename-function)
+(defvar org-ref-default-citation-link)
+(defvar org-ref-cite-types)
+(defvar org-ref-insert-link-function)
+(defvar org-ref-insert-cite-function)
+(defvar org-ref-insert-label-function)
+(defvar org-ref-insert-ref-function)
+(defvar org-ref-cite-onclick-function)
+(defvar org-ref-insert-cite-key)
+
 ;;; Code:
+(require 'helm-config)
+(require 'helm)
+(require 'helm-bibtex)
+(require 'helm-utils)
 (require 'org-ref-helm)
-(unless (require 'helm-bibtex nil t)
-  (message "Org-ref is installing `helm-bibtex'...")
-  (let ((package-archives '(("gnu"         . "http://elpa.gnu.org/packages/")
-			    ("melpa" . "http://melpa.org/packages/"))))
-    (package-initialize)
-    (package-refresh-contents)
-    (package-install 'helm-bibtex))
-  (require 'helm-bibtex))
+(require 'async)
+(require 'package)
 
 ;;;###autoload
 (defun org-ref-bibtex-completion-completion ()
@@ -41,31 +53,36 @@
 	org-ref-insert-cite-function 'org-ref-helm-insert-cite-link
 	org-ref-insert-label-function 'org-ref-helm-insert-label-link
 	org-ref-insert-ref-function 'org-ref-helm-insert-ref-link
-	org-ref-cite-onclick-function 'org-ref-cite-click-helm)
-
-  ;; define key for inserting citations
-  (define-key org-mode-map
-    (kbd org-ref-insert-cite-key)
-    org-ref-insert-link-function))
+	org-ref-cite-onclick-function 'org-ref-cite-click-helm))
 
 (org-ref-bibtex-completion-completion)
+(define-key org-mode-map
+  (kbd org-ref-insert-cite-key)
+  org-ref-insert-link-function)
 
 (defcustom org-ref-bibtex-completion-actions
   '(("Insert citation" . helm-bibtex-insert-citation)
-    ("Open PDF file (if present)" . helm-bibtex-open-pdf)
+    ("Open PDF, URL or DOI" . helm-bibtex-open-any)
     ("Open URL or DOI in browser" . helm-bibtex-open-url-or-doi)
     ("Insert reference" . helm-bibtex-insert-reference)
     ("Insert BibTeX key" . helm-bibtex-insert-key)
     ("Insert BibTeX entry" . helm-bibtex-insert-bibtex)
+    ("Insert formatted citation(s)" . (lambda (_)
+					(insert
+					 (mapconcat 'identity
+						    (cl-loop for key in (helm-marked-candidates)
+							     collect (org-ref-format-entry key))
+						    "\n\n"))))
     ("Attach PDF to email" . helm-bibtex-add-PDF-attachment)
-    ("Edit notes" . bibtex-completion-edit-notes)
-    ("Show entry" . bibtex-completion-show-entry)
+    ("Edit notes" . helm-bibtex-edit-notes)
+    ("Show entry" . helm-bibtex-show-entry)
     ("Add keywords to entries" . org-ref-helm-tag-entries)
-    ("Copy entry to clipboard" . bibtex-completion-copy-candidate))
+    ("Copy entry to clipboard" . bibtex-completion-copy-candidate) 
+    ("Add PDF to library" . helm-bibtex-add-pdf-to-library))
   "Cons cells of string and function to set the actions of `helm-bibtex' to.
 The car of cons cell is the string describing the function.
 The cdr of the the cons cell is the function to use."
-  :type 'list
+  :type '(alist :key-type (string) :value-type (function))
   :group 'org-ref)
 
 
@@ -97,35 +114,8 @@ The cdr of the the cons cell is the function to use."
 ;;* Helm bibtex setup.
 (setq bibtex-completion-additional-search-fields '(keywords))
 
-(defun bibtex-completion-candidates-formatter (candidates _source)
-  "Formats BibTeX entries for display in results list.
-Argument CANDIDATES helm candidates.
-Argument SOURCE the helm source.
-
-Adapted from the function in `helm-bibtex' to include additional
-fields, the keywords I think."
-  (cl-loop
-   with width = (with-helm-window (helm-bibtex-window-width))
-   for entry in candidates
-   for entry = (cdr entry)
-   for entry-key = (bibtex-completion-get-value "=key=" entry)
-   if (assoc-string "author" entry 'case-fold)
-   for fields = '("author" "title"  "year" "=has-pdf=" "=has-note=" "=type=")
-   else
-   for fields = '("editor" "title" "year" "=has-pdf=" "=has-note=" "=type=")
-   for fields = (--map (bibtex-completion-clean-string
-                        (bibtex-completion-get-value it entry " "))
-                       fields)
-   for fields = (-update-at 0 'bibtex-completion-shorten-authors fields)
-   for fields = (append fields
-                        (list (or (bibtex-completion-get-value "keywords" entry)
-                                  "")))
-   collect
-   (cons (s-format "$0 $1 $2 $3 $4$5 $6" 'elt
-                   (-zip-with (lambda (f w) (truncate-string-to-width f w 0 ?\s))
-                              fields (list 36 (- width 85) 4 1 1 7 7)))
-         entry-key)))
-
+(setq bibtex-completion-display-formats
+      '((t . "${author:36} ${title:*} ${year:4} ${=has-pdf=:1}${=has-note=:1} ${=type=:7} ${keywords:31}")))
 
 (defun bibtex-completion-copy-candidate (_candidate)
   "Copy the selected bibtex entries to the clipboard.
@@ -152,39 +142,40 @@ CANDIDATE is ignored."
 	(kill-new (buffer-string))))))
 
 
-(helm-add-action-to-source
- "Copy entry to clipboard"
- 'bibtex-completion-copy-candidate
- helm-source-bibtex)
-
 
 (defun org-ref-helm-tag-entries (_candidates)
   "Set tags on selected bibtex entries from `helm-bibtex'.
 User is prompted for tags.  This function is called from `helm-bibtex'.
 Argument CANDIDATES helm candidates."
   (message "")
-  (let ((keywords (read-string "Keywords (comma separated): ")))
-    (cl-loop for key in (helm-marked-candidates)
-             do
-             (save-window-excursion
-               (bibtex-completion-show-entry key)
-               (bibtex-set-field
-                "keywords"
-                (concat
-                 keywords
-                 ", " (bibtex-autokey-get-field "keywords")))
-	       (when (looking-back ", ")
-	       	 (delete-backward-char 2))
+  (let* ((keys (helm-marked-candidates))
+	 (entry (bibtex-completion-get-entry (car keys)))
+	 (field (cdr (assoc-string "keywords" entry)))
+	 (value (when field (replace-regexp-in-string "^{\\|}$" "" field)))
+	 (keywords (read-string "Keywords (comma separated): "
+				(when (and value (not (equal "" value)))
+				  (concat value ", ")))))
+    (cl-loop for key in keys
+	     do
+	     (save-window-excursion
+	       (bibtex-completion-show-entry (list key))
+	       ;; delete keyword field if empty
+	       (if (equal "" keywords)
+		   (save-restriction
+		     (bibtex-narrow-to-entry)
+		     (goto-char (car (cdr (bibtex-search-forward-field "keywords" t))))
+		     (bibtex-kill-field))
+		 (bibtex-set-field
+		  "keywords"
+		  (concat
+		   (if (listp keywords)
+		       (if (string-match value keywords)
+		  	   (and (replace-match "")
+		  		(mapconcat 'identity keywords ", "))
+		  	 (mapconcat 'identity keywords ", "))
+		     ;; remove trailing comma
+		     (replace-regexp-in-string ", $" "" keywords)))))
 	       (save-buffer)))))
-
-
-
-
-;; Add a new action
-(helm-add-action-to-source
- "Add keywords to entries"
- 'org-ref-helm-tag-entries
- helm-source-bibtex)
 
 
 (defun org-ref-bibtex-completion-format-org (keys)
@@ -243,10 +234,11 @@ change the key at point to the selected keys."
 	  ;; goto next comma or end
 	  (re-search-forward
 	   ","
-	   (org-element-property :end object) t)
+	   (org-element-property :end object) 'mv)
 	  (skip-chars-backward " ")
-	  (insert (mapconcat 'identity keys ","))
-	  (unless (looking-at ",") (insert ",")))))
+	  (skip-chars-backward "]")
+	  (unless (looking-at ",") (insert ","))
+	  (insert (mapconcat 'identity keys ",")))))
        ;; double prefix, replace key at point
        ((equal helm-current-prefix-arg '(16))
         (setf (buffer-substring
@@ -278,21 +270,122 @@ change the key at point to the selected keys."
 
      ;; insert fresh link
      (t
-      ;;(message-box "fresh link")
       (insert
-       (concat (if (equal helm-current-prefix-arg '(4))
-                   (helm :sources `((name . "link types")
-                                    (candidates . ,org-ref-cite-types)
-                                    (action . (lambda (x) x))))
-                 org-ref-default-citation-link)
-               ":"
-               (s-join "," keys))))))
+       (concat
+	(when org-ref-prefer-bracket-links "[[")
+	(if (equal helm-current-prefix-arg '(4))
+	    (helm :sources `((name . "link types")
+			     (candidates . ,org-ref-cite-types)
+			     (action . (lambda (x) x))))
+	  org-ref-default-citation-link)
+	":"
+	(s-join "," keys)
+	(when org-ref-prefer-bracket-links "]]"))))))
   ;; return empty string for helm
   "")
 
 
+(defun org-ref-format-citation (keys)
+  "Formatter for org-ref citation commands.
+Prompt for the command and additional arguments if the commands can
+take any. If point is inside a citation link, append KEYS. Otherwise
+prompt for pre/post text. Prompts can also be switched off by setting
+the variable `bibtex-completion-cite-prompt-for-optional-arguments' to
+nil. To enable this formatter, add it to
+`bibtex-completion-format-citation-functions'. For example:
+
+\(setf (cdr (assoc 'org-mode bibtex-completion-format-citation-functions)) 'org-ref-format-citation)
+
+Note also that pre text is preceded by a double colon, for example:
+
+\[[cite:key][See::Chapter 1]], which exports to:
+
+\\cite[See][Chapter 1]{key}."
+  ;; Check if point is inside a cite link
+  (let ((link (org-element-context))
+	end path)
+    (if (-contains? org-ref-cite-types (org-element-property :type link))
+	(progn
+	  (setq end (org-element-property :end link)
+		path (org-element-property :path link))
+	  (goto-char end)
+	  (skip-chars-backward " ")
+	  ;; Check if link has pre/post text
+	  (if (looking-back "\]" (line-beginning-position))
+	      (progn
+		(re-search-backward path nil t)
+		(re-search-forward "\]" nil t)
+		(backward-char 1)
+		(format ",%s" (s-join "," keys))))
+	  (format ",%s" (s-join "," keys)))
+      (let* ((initial (when bibtex-completion-cite-default-as-initial-input bibtex-completion-cite-default-command))
+	     (default
+	       (unless bibtex-completion-cite-default-as-initial-input bibtex-completion-cite-default-command))
+	     (default-info
+	       (if default (format " (default \"%s\")" default) ""))
+	     (cite-command
+	      (completing-read (format "Cite command%s: " default-info)
+			       bibtex-completion-cite-commands nil nil initial
+			       'bibtex-completion-cite-command-history default nil)))
+	(if (member cite-command '("nocite" "supercite"))  ; These don't want arguments.
+	    (format "%s:%s" cite-command (s-join "," keys))
+	  (let ((text (if bibtex-completion-cite-prompt-for-optional-arguments
+			  (read-from-minibuffer "Pre/post text: ")
+			"")))
+	    (if (string= "" text)
+		(format "%s:%s" cite-command (s-join "," keys))
+	      (format "[[%s:%s][%s]]" cite-command (s-join "," keys) text))))))))
+
+
+(defvar bibtex-completion-cached-candidates)
+(defvar bibtex-completion-bibliography-hash)
+
 ;;;###autoload
-(defun org-ref-helm-insert-cite-link (arg)
+(defun org-ref-helm-load-completions-async ()
+  "Load the bibtex files into helm sources asynchronously.
+For large bibtext files, the intial call to ‘org-ref-helm-insert-cite-link’
+can take a long time to load the completion sources.  This function loads
+the completion sources in the background so the initial call to ‘org-ref-helm-insert-cite-link’ is much faster."
+  (interactive)
+  (async-start
+   `(lambda (&optional formatter)
+      (require 'package)
+      (package-initialize)
+      (require 'helm-bibtex)
+      ,(async-inject-variables "bibtex-compl.*")
+
+      (with-temp-buffer
+	(mapc #'insert-file-contents
+	      (-flatten (list bibtex-completion-bibliography)))
+	;; Check hash of bibliography and reparse if necessary:
+	(let ((bibliography-hash (secure-hash 'sha256 (current-buffer))))
+	  (unless (and bibtex-completion-cached-candidates
+		       (string= bibtex-completion-bibliography-hash bibliography-hash))
+	    (message "Loading bibliography ...")
+	    (let* ((entries (bibtex-completion-parse-bibliography))
+		   (entries (bibtex-completion-resolve-crossrefs entries))
+		   (entries (bibtex-completion-prepare-entries entries))
+		   (entries (nreverse entries))
+		   (entries
+		    (--map (cons (bibtex-completion-clean-string
+				  (s-join " " (-map #'cdr it))) it)
+			   entries)))
+	      (setq bibtex-completion-cached-candidates
+		    (if (functionp formatter)
+			(funcall formatter entries)
+		      entries)))
+	    (setq bibtex-completion-bibliography-hash bibliography-hash))
+	  (cons bibliography-hash bibtex-completion-cached-candidates))))
+   (lambda (result)
+     (setq bibtex-completion-cached-candidates (cdr result))
+     (setq bibtex-completion-bibliography-hash (car result))
+     (message "Finished loading org-ref completions"))))
+
+
+
+
+;;;###autoload
+(defun org-ref-helm-insert-cite-link (&optional arg)
   "Insert a citation link with `helm-bibtex'.
 With one prefix ARG, insert a ref link.
 With two prefix ARGs, insert a label link."
@@ -332,9 +425,12 @@ With two prefix ARGs, insert a label link."
 Checks for pdf and doi, and add appropriate functions."
   (let* ((results (org-ref-get-bibtex-key-and-file))
          (key (car results))
-         (pdf-file (funcall org-ref-get-pdf-filename-function key))
-	 (pdf-other (bibtex-completion-find-pdf key))
          (bibfile (cdr results))
+	 (bibtex-completion-bibliography (list bibfile))
+	 (entry (bibtex-completion-get-entry key))
+	 (pdf-file (funcall org-ref-get-pdf-filename-function key))
+	 (pdf-bibtex-completion (car (bibtex-completion-find-pdf key)))
+         (notes-p (cdr (assoc "=has-note=" entry)))
          (url (save-excursion
                 (with-temp-buffer
                   (insert-file-contents bibfile)
@@ -357,30 +453,37 @@ Checks for pdf and doi, and add appropriate functions."
     (when (string= url "") (setq url nil))
 
     ;; Conditional pdf functions
-    (if (file-exists-p pdf-file)
+    ;; try with org-ref first
+    (cond ((file-exists-p pdf-file)
+    	   (cl-pushnew
+    	    '("Open pdf" . (lambda ()
+    			     (funcall org-ref-open-pdf-function)))
+    	    candidates))
+
+	  ;; try with bibtex-completion
+    	  (pdf-bibtex-completion
+    	   (cl-pushnew
+    	    '("Open pdf" . (lambda ()
+    			     (funcall org-ref-open-pdf-function)))
+    	    candidates))
+
+	  ;; try with doi
+    	  (t
+    	   (cl-pushnew
+    	    '("Try to get pdf" . (lambda ()
+    				   (save-window-excursion
+    				     (org-ref-open-citation-at-point)
+    				     (bibtex-beginning-of-entry)
+    				     (doi-utils-get-bibtex-entry-pdf))))
+    	    candidates)))
+
+    (if notes-p
 	(cl-pushnew
-	 '("Open pdf" . (lambda ()
-			  (funcall org-ref-open-pdf-function)))
+	 '("Open notes" . org-ref-open-notes-at-point)
 	 candidates)
-
-      (if pdf-other
-	  (cl-pushnew
-	   '("Open pdf" . (lambda ()
-			    (funcall org-ref-open-pdf-function)))
-	   candidates)
-
-	(cl-pushnew
-	 '("Try to get pdf" . (lambda ()
-				(save-window-excursion
-				  (org-ref-open-citation-at-point)
-				  (bibtex-beginning-of-entry)
-				  (doi-utils-get-bibtex-entry-pdf))))
-	 candidates)))
-
-
-    (cl-pushnew
-     '("Open notes" . org-ref-open-notes-at-point)
-     candidates)
+      (cl-pushnew
+       '("Add notes" . org-ref-open-notes-at-point)
+       candidates))
 
     ;; conditional url and doi functions
     (when (or url doi)
@@ -416,6 +519,11 @@ Checks for pdf and doi, and add appropriate functions."
     (cl-pushnew
      '("Delete citation at point" . org-ref-delete-cite-at-point)
      candidates)
+
+    (when bibtex-completion-cite-prompt-for-optional-arguments
+      (cl-pushnew
+       '("Update pre/post text" . org-ref-update-pre-post-text)
+       candidates))
 
     (cl-pushnew
      '("Sort keys by year" . org-ref-sort-citation-link)
@@ -529,7 +637,7 @@ action.  most of them need the point and buffer.
 
 KEY is returned for the selected item(s) in helm."
   (interactive)
-  (let ((name (org-ref-get-citation-string-at-point))
+  (let ((name (org-ref-format-entry (org-ref-get-bibtex-key-under-cursor)))
         (candidates (org-ref-cite-candidates))
         (cb (current-buffer)))
 
@@ -543,6 +651,82 @@ KEY is returned for the selected item(s) in helm."
                       (action . (lambda (f)
                                   (switch-to-buffer ,cb)
                                   (funcall f))))))))
+
+
+;; browse labels
+
+(defun org-ref-browser-label-source ()
+  (let ((labels (org-ref-get-labels)))
+    (helm-build-sync-source "Browse labels"
+      :follow 1
+      :candidates labels
+      :action '(("Browse labels" . (lambda (label)
+				     (with-selected-window (selected-window)
+				       (org-open-link-from-string
+					(format "ref:%s" label)))))))))
+
+;; browse citation links
+
+(defun org-ref-browser-transformer (candidates)
+  "Add counter to candidates."
+  (let ((counter 0))
+    (cl-loop for i in candidates
+	     collect (format "%s %s" (cl-incf counter) i))))
+
+(defun org-ref-browser-display (candidate)
+  "Strip counter from candidates."
+  (replace-regexp-in-string "^[0-9]+? " "" candidate))
+
+;;;###autoload
+(defun org-ref-browser (&optional arg)
+  "Quickly browse label links in helm.
+With a prefix ARG, browse citation links."
+  (interactive "P")
+  (if arg
+      (let ((keys nil)
+	    (alist nil))
+	(widen)
+	(outline-show-all)
+	(org-element-map (org-element-parse-buffer) 'link
+	  (lambda (link)
+	    (let ((plist (nth 1 link)))
+	      (when (-contains? org-ref-cite-types (plist-get plist ':type))
+		(let ((start (org-element-property :begin link)))
+		  (dolist (key
+			   (org-ref-split-and-strip-string (plist-get plist ':path)))
+		    (setq keys (append keys (list key)))
+		    (setq alist (append alist (list (cons key start))))))))))
+	(let ((counter 0)
+	      count-key-pos)
+	  ;; the idea here is to create an alist with ("counter key" .
+	  ;; position) to produce unique candidates
+	  (setq count-key-pos (mapcar (lambda (x)
+					(cons
+					 (format "%s %s" (cl-incf counter) (car x)) (cdr x)))
+				      alist))
+	  ;; push mark to restore position with C-u C-SPC
+	  (push-mark (point))
+	  ;; move point to the first citation link in the buffer
+	  (goto-char (cdr (assoc (caar alist) alist)))
+	  (helm :sources
+		(helm-build-sync-source "Browse citation links"
+		  :follow 1
+		  :candidates keys
+		  :candidate-transformer 'org-ref-browser-transformer
+		  :real-to-display 'org-ref-browser-display
+		  :persistent-action (lambda (candidate)
+				       (helm-goto-char
+					(cdr (assoc candidate count-key-pos))))
+		  :action `(("Open menu" . ,(lambda (candidate)
+					      (helm-goto-char
+					       (cdr (assoc candidate count-key-pos)))
+					      (org-open-at-point)))))
+		:candidate-number-limit 10000
+		:buffer "*helm browser*")))
+    (helm :sources (org-ref-browser-label-source)
+	  :buffer "*helm labels*")))
+
+
 
 (provide 'org-ref-helm-bibtex)
 ;;; org-ref-helm-bibtex.el ends here
